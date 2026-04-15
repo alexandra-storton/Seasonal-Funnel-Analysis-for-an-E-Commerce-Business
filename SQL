@@ -1,0 +1,377 @@
+Query 1 : New vs Existing Users
+
+🔍 What this SQL is doing
+This query categorises website visitors into "New" versus "Returning" users by analysing Google Analytics 4 (GA4) session data. It identifies a user's very first interaction within the specified date range and calculates the percentage of the total audience each group represents.
+
+🎯 Skills Demonstrated
+The script demonstrates advanced BigQuery GA4 handling, specifically the ability to UNNEST complex event parameters to extract session numbers. It also showcases proficiency in multi-step data processing using Common Table Expressions (CTEs) and Window Functions to calculate percentage-of-total metrics without needing a separate join or subquery.
+
+WITH user_sessions AS (
+ SELECT
+   user_pseudo_id,
+   event_date,
+   event_timestamp,
+   (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_number') AS session_number
+ FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+ WHERE event_name = 'session_start'
+   AND _TABLE_SUFFIX BETWEEN '20201101' AND '20210103'
+   AND DATE(PARSE_DATE('%Y%m%d', event_date)) <= DATE('2021-01-03')
+),
+user_classification AS (
+ SELECT
+   user_pseudo_id,
+   MIN(session_number) AS first_session_number,
+   MIN(event_timestamp) AS first_seen_timestamp
+ FROM user_sessions
+ GROUP BY user_pseudo_id
+)
+SELECT
+ CASE
+   WHEN first_session_number = 1 THEN 'New User'
+   ELSE 'Returning User'
+ END AS user_type,
+ COUNT(DISTINCT user_pseudo_id) AS total_users,
+ ROUND(COUNT(DISTINCT user_pseudo_id) / SUM(COUNT(DISTINCT user_pseudo_id)) OVER () * 100, 2) AS pct_of_total
+FROM user_classification
+GROUP BY user_type
+ORDER BY total_users DESC;
+
+
+Query 2 : Repurchase Statistics
+
+🔍 What this SQL is doing
+
+This query calculates statistics using the time elapsed between a user's first visit and their second purchase to determine the natural repurchase cycle of the customer base. By identifying key percentiles (75th, 85th, 90th), it establishes a data-driven "cut-off date," ensuring that the analysis only includes timeframes where customers have had a sufficient statistical window to make a repeat purchase.
+
+🎯 Skills Demonstrated
+
+The script showcases advanced statistical profiling within BigQuery, using APPROX_QUANTILES to calculate the median and specific percentiles for time-to-event data. It effectively utilizes Window Functions (ROW_NUMBER) and multiple Common Table Expressions (CTEs) to isolate specific user milestones, demonstrating the ability to perform complex cohort analysis on large-scale event data.
+
+-- Step 1: Get first visit per user
+WITH first_visits AS (
+    SELECT
+        user_pseudo_id,
+        MIN(event_timestamp) AS first_visit_ts
+    FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+    WHERE event_name = 'first_visit'
+    GROUP BY user_pseudo_id
+),
+
+-- Step 2: Rank purchases per user
+purchase_ranks AS (
+    SELECT
+        user_pseudo_id,
+        event_timestamp,
+        ROW_NUMBER() OVER (
+            PARTITION BY user_pseudo_id
+            ORDER BY event_timestamp
+        ) AS purchase_rank
+    FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+    WHERE event_name = 'purchase'
+),
+
+-- Step 3: Get second purchase timestamp
+second_purchase AS (
+    SELECT
+        user_pseudo_id,
+        event_timestamp AS second_purchase_ts
+    FROM purchase_ranks
+    WHERE purchase_rank = 2
+),
+
+-- Step 4: Calculate days from first visit → second purchase
+user_purchase_diff AS (
+    SELECT
+        fv.user_pseudo_id,
+        TIMESTAMP_DIFF(
+            TIMESTAMP_MICROS(sp.second_purchase_ts),
+            TIMESTAMP_MICROS(fv.first_visit_ts),
+            DAY
+        ) AS days_between
+    FROM first_visits fv
+    JOIN second_purchase sp
+      ON fv.user_pseudo_id = sp.user_pseudo_id
+)
+
+-- Step 5: Summary stats
+SELECT
+    COUNT(*) AS number_repeat_purchasers,
+    AVG(days_between) AS avg_days_to_second_purchase,
+
+    -- median
+    APPROX_QUANTILES(days_between, 100)[OFFSET(50)] AS median_days_to_second_purchase,
+
+    -- 75th percentile
+    APPROX_QUANTILES(days_between, 100)[OFFSET(75)] AS p75_days_to_second_purchase,
+
+    -- 85th percentile
+    APPROX_QUANTILES(days_between, 100)[OFFSET(85)] AS p85_days_to_second_purchase,
+
+    -- 90th percentile
+    APPROX_QUANTILES(days_between, 100)[OFFSET(90)] AS p90_days_to_second_purchase,
+
+    -- mode
+    (
+        SELECT days_between
+        FROM (
+            SELECT
+                days_between,
+                COUNT(*) AS freq
+            FROM user_purchase_diff
+            GROUP BY days_between
+            ORDER BY freq DESC
+            LIMIT 1
+        )
+    ) AS mode_days_to_second_purchase
+
+FROM user_purchase_diff;
+
+
+Query 3 : Funnel (New Customers)
+
+🔍 What this SQL is doing
+This query constructs a linear conversion funnel by tracking the first occurrence of key user milestones: visiting the site, viewing a product, adding to cart, and making a first and second purchase. It applies a strict sequential logic (ensuring each stage happens after the previous one) and uses the 8-day threshold identified in Query 2 to ensure the data represents a complete and accurate conversion window.
+
+🎯 Skills Demonstrated
+The script demonstrates advanced sequential funnel modelling by using conditional COUNTIF logic combined with timestamp comparisons to ensure chronological integrity. It showcases proficiency in complex data joining and event-based filtering, successfully merging granular event logs with ranked purchase data to provide a comprehensive view of the end-to-end customer journey.
+
+WITH events_clean AS (
+ SELECT
+   user_pseudo_id,
+   event_name,
+   event_timestamp
+
+ FROM  `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+ WHERE event_name IN ('first_visit','view_item','add_to_cart','purchase')
+),
+
+-- Step 1 : Identify first occurrence of each stage per user 
+-- 2021-01-03 chosen as threshold with 85% customers complete funnel after 18 days
+user_stages AS (
+ SELECT
+   user_pseudo_id,
+   MIN(CASE WHEN event_name = 'first_visit' THEN event_timestamp END) AS first_visit_ts,
+   MIN(CASE WHEN event_name = 'view_item' THEN event_timestamp END) AS view_item_ts,
+   MIN(CASE WHEN event_name = 'add_to_cart' THEN event_timestamp END) AS add_to_cart_ts,
+   MIN(CASE WHEN event_name = 'purchase' THEN event_timestamp END) AS purchase_ts
+ FROM events_clean
+ GROUP BY user_pseudo_id
+),
+
+--Step 2 : Add in timestamp for second purchase
+purchase_ranks AS (
+ SELECT
+   user_pseudo_id,
+   event_timestamp,
+   ROW_NUMBER() OVER (
+     PARTITION BY user_pseudo_id
+     ORDER BY event_timestamp
+   ) AS purchase_rank
+ FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+ WHERE event_name = 'purchase'
+),
+
+second_purchase AS (
+ SELECT
+   user_pseudo_id,
+   event_timestamp AS second_purchase_ts 
+ FROM purchase_ranks
+ WHERE purchase_rank = 2
+)
+
+-- Step 3: Aggregate for funnel
+SELECT
+ COUNT(us.user_pseudo_id) AS users_total,
+ COUNTIF(first_visit_ts IS NOT NULL) AS stage_first_visit,
+ COUNTIF(view_item_ts IS NOT NULL AND view_item_ts > first_visit_ts) AS stage_view_item,
+ COUNTIF(add_to_cart_ts IS NOT NULL AND add_to_cart_ts > view_item_ts) AS stage_add_to_cart,
+ COUNTIF(purchase_ts IS NOT NULL AND purchase_ts > add_to_cart_ts) AS stage_purchase,
+ COUNTIF(second_purchase_ts IS NOT NULL) AS stage_second_purchase
+FROM user_stages us
+LEFT JOIN second_purchase sp ON us.user_pseudo_id = sp.user_pseudo_id
+WHERE DATE(TIMESTAMP_MICROS(first_visit_ts)) <= DATE('2021-01-23');
+
+
+Query 4 : Weekly Cohort Funnel Analysis (View item & Add to Cart)
+
+🔍 What this SQL is doing
+This query performs a cohort analysis by grouping new users into their specific "acquisition week" based on their first visit. It then tracks their progression through key micro-conversion steps—viewing an item and adding a product to the basket—to calculate conversion rates for each cohort. This allows the business to monitor if the quality of traffic or site engagement is improving or declining week-over-week.
+
+🎯 Skills Demonstrated
+The script demonstrates advanced cohort analysis and date manipulation by using FORMAT_DATE to bucket users into weekly segments. It showcases proficiency in efficient data joining and safe arithmetic (using SAFE_DIVIDE to prevent errors), along with the ability to use conditional aggregation (MAX(CASE...)) to pivot granular event logs into a user-level behavioral summary.
+
+WITH new_customers AS (
+ SELECT
+   user_pseudo_id,
+   MIN(event_timestamp) AS first_visit_ts
+ FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+ WHERE event_name = 'first_visit'
+ GROUP BY user_pseudo_id
+ HAVING DATE(TIMESTAMP_MICROS(MIN(event_timestamp))) <= DATE('2021-01-17')
+),
+customer_behavior AS (
+ SELECT
+   nc.user_pseudo_id,
+   FORMAT_DATE('%Y-W%U', DATE(TIMESTAMP_MICROS(nc.first_visit_ts))) AS acquisition_week,
+   MAX(CASE WHEN e.event_name = 'view_item' THEN 1 ELSE 0 END) AS had_view_item,
+   MAX(CASE WHEN e.event_name = 'add_to_cart' THEN 1 ELSE 0 END) AS had_added_to_basket
+ FROM new_customers nc
+ LEFT JOIN `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*` e
+   ON nc.user_pseudo_id = e.user_pseudo_id
+ GROUP BY nc.user_pseudo_id, acquisition_week
+)
+SELECT
+ acquisition_week,
+ COUNT(DISTINCT user_pseudo_id) AS total_customers,
+ SUM(had_view_item) AS customers_who_viewed_item,
+ SUM(had_added_to_basket) AS customers_who_added_to_basket,
+ ROUND(SAFE_DIVIDE(SUM(had_view_item), COUNT(DISTINCT user_pseudo_id)) * 100, 2) AS view_item_rate_pct,
+ ROUND(SAFE_DIVIDE(SUM(had_added_to_basket), SUM(had_view_item)) * 100, 2) AS added_to_basket_rate_pct
+FROM customer_behavior
+GROUP BY acquisition_week
+ORDER BY acquisition_week DESC;
+
+
+Query 6 : Seasonal Funnel
+
+🔍 What this SQL is doing
+This query segments the conversion funnel into specific seasonal trading periods (Pre-Black Friday, BFCM, Christmas, and Post-Christmas) to evaluate how promotional windows impact user behaviour. It tracks new users through every stage—from their first visit to a second purchase—allowing the business to compare conversion efficiency and customer "quality" across different peaks in the retail calendar.
+
+🎯 Skills Demonstrated
+The script showcases strategic data segmentation by using complex CASE statements to create custom time-based buckets for seasonal analysis. It demonstrates an advanced ability to integrate multiple data models, merging chronological funnel logic with custom period definitions and Window Functions to provide a high-level comparative analysis of marketing effectiveness over time.
+
+WITH events_clean AS (
+ SELECT
+   user_pseudo_id,
+   event_name,
+   event_timestamp
+ FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+ WHERE event_name IN ('first_visit','view_item','add_to_cart','purchase')
+),
+
+
+-- Step 1: First occurrence of each stage per user
+user_stages AS (
+ SELECT
+   user_pseudo_id,
+   MIN(CASE WHEN event_name = 'first_visit' THEN event_timestamp END) AS first_visit_ts,
+   MIN(CASE WHEN event_name = 'view_item' THEN event_timestamp END) AS view_item_ts,
+   MIN(CASE WHEN event_name = 'add_to_cart' THEN event_timestamp END) AS add_to_cart_ts,
+   MIN(CASE WHEN event_name = 'purchase' THEN event_timestamp END) AS purchase_ts
+ FROM events_clean
+ GROUP BY user_pseudo_id
+),
+
+
+-- Step 2: Second purchase
+purchase_ranks AS (
+ SELECT
+   user_pseudo_id,
+   event_timestamp,
+   ROW_NUMBER() OVER (
+     PARTITION BY user_pseudo_id
+     ORDER BY event_timestamp
+   ) AS purchase_rank
+ FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+ WHERE event_name = 'purchase'
+),
+
+
+second_purchase AS (
+ SELECT
+   user_pseudo_id,
+   event_timestamp AS second_purchase_ts
+ FROM purchase_ranks
+ WHERE purchase_rank = 2
+),
+
+
+-- Step 3: Filter to NEW USERS + assign updated period buckets
+users_with_period AS (
+ SELECT
+   us.*,
+   DATE(TIMESTAMP_MICROS(first_visit_ts)) AS first_visit_date,
+
+
+   CASE
+     WHEN DATE(TIMESTAMP_MICROS(first_visit_ts)) BETWEEN '2020-11-01' AND '2020-11-26'
+       THEN 'Pre-Black Friday'
+     WHEN DATE(TIMESTAMP_MICROS(first_visit_ts)) BETWEEN '2020-11-27' AND '2020-11-30'
+       THEN 'Black Friday / Cyber Monday'
+     WHEN DATE(TIMESTAMP_MICROS(first_visit_ts)) BETWEEN '2020-12-01' AND '2020-12-20'
+       THEN 'Christmas Period'
+     WHEN DATE(TIMESTAMP_MICROS(first_visit_ts)) BETWEEN '2020-12-21' AND '2021-01-23'
+       THEN 'Post-Christmas'
+   END AS period
+
+
+ FROM user_stages us
+ WHERE DATE(TIMESTAMP_MICROS(first_visit_ts))
+       BETWEEN '2020-11-01' AND '2021-01-23'
+)
+
+
+-- Step 4: Funnel by period
+SELECT
+ period,
+ COUNT(u.user_pseudo_id) AS users_total,
+
+
+ COUNTIF(first_visit_ts IS NOT NULL) AS stage_first_visit,
+
+
+ COUNTIF(view_item_ts IS NOT NULL
+   AND view_item_ts > first_visit_ts) AS stage_view_item,
+
+
+ COUNTIF(add_to_cart_ts IS NOT NULL
+   AND add_to_cart_ts > view_item_ts) AS stage_add_to_cart,
+
+
+ COUNTIF(purchase_ts IS NOT NULL
+   AND purchase_ts > add_to_cart_ts) AS stage_purchase,
+
+
+ COUNTIF(second_purchase_ts IS NOT NULL) AS stage_second_purchase
+
+
+FROM users_with_period u
+LEFT JOIN second_purchase sp
+ ON u.user_pseudo_id = sp.user_pseudo_id
+
+
+GROUP BY period
+ORDER BY
+ CASE period
+   WHEN 'Pre-Black Friday' THEN 1
+   WHEN 'Black Friday / Cyber Monday' THEN 2
+   WHEN 'Christmas Period' THEN 3
+   WHEN 'Post-Christmas' THEN 4
+ END;
+
+
+
+Query 7 : ...
+
+🔍 What this SQL is doing
+
+
+🎯 Skills Demonstrated
+
+
+Query 8 : ...
+
+🔍 What this SQL is doing
+
+
+🎯 Skills Demonstrated
+
+
+Query 9 : ...
+
+🔍 What this SQL is doing
+
+
+🎯 Skills Demonstrated
+
+
